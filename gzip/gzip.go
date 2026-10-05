@@ -36,6 +36,7 @@ const (
 type Writer struct {
 	Header      // written at first call to Write, Flush, or Close
 	w           io.Writer
+	cw          *countingWriter // wraps w to track total bytes written
 	level       int
 	err         error
 	compressor  *flate.Writer
@@ -43,7 +44,21 @@ type Writer struct {
 	size        uint32 // Uncompressed size (section 2.3.1)
 	wroteHeader bool
 	closed      bool
+	lastFlushIn int64 // total uncompressed input at the last successful flush
 	buf         [10]byte
+}
+
+// countingWriter wraps an io.Writer and records the total number of bytes
+// successfully written to it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
 }
 
 // NewWriter returns a new Writer.
@@ -96,10 +111,11 @@ func NewWriterWindow(w io.Writer, windowSize int) (*Writer, error) {
 }
 
 func (z *Writer) init(w io.Writer, level int) {
+	cw := &countingWriter{w: w}
 	compressor := z.compressor
 	if level != StatelessCompression {
 		if compressor != nil {
-			compressor.Reset(w)
+			compressor.Reset(cw)
 		}
 	}
 
@@ -107,7 +123,8 @@ func (z *Writer) init(w io.Writer, level int) {
 		Header: Header{
 			OS: 255, // unknown
 		},
-		w:          w,
+		w:          cw,
+		cw:         cw,
 		level:      level,
 		compressor: compressor,
 	}
@@ -166,11 +183,17 @@ func (z *Writer) writeString(s string) (err error) {
 	return err
 }
 
+// errClosed is returned by Write when the Writer has been closed.
+var errClosed = errors.New("gzip: writer is closed")
+
 // Write writes a compressed form of p to the underlying io.Writer. The
 // compressed bytes are not necessarily flushed until the Writer is closed.
 func (z *Writer) Write(p []byte) (int, error) {
 	if z.err != nil {
 		return 0, z.err
+	}
+	if z.closed {
+		return 0, errClosed
 	}
 	var n int
 	// Write the GZIP header lazily.
@@ -256,7 +279,56 @@ func (z *Writer) Flush() error {
 		}
 	}
 	z.err = z.compressor.Flush()
+	if z.err == nil {
+		z.lastFlushIn = int64(z.size)
+	}
 	return z.err
+}
+
+// FlushBoundary flushes any pending compressed data to the underlying writer
+// and returns a receipt describing the boundary reached.
+//
+// The receipt's Input field is the total number of uncompressed bytes encoded
+// up to and including this flush boundary. The Output field is the total number
+// of compressed bytes actually written to the underlying writer up to and
+// including this flush boundary; if the underlying writer short-writes or
+// fails, Output reflects the actual prefix written and the error reports the
+// failure.
+//
+// FlushBoundary does not close the writer or write the gzip trailer; after it
+// returns the writer remains open and can accept more input. Use Close to end
+// the stream.
+//
+// If no input has been written since the last flush, FlushBoundary is a no-op
+// and returns the current boundary without emitting additional sync bytes.
+func (z *Writer) FlushBoundary() (flate.Flushed, error) {
+	if z.err != nil {
+		return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, z.err
+	}
+	if z.closed {
+		return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, nil
+	}
+	if !z.wroteHeader {
+		z.Write(nil)
+		if z.err != nil {
+			return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, z.err
+		}
+	}
+	if int64(z.size) == z.lastFlushIn {
+		// No new input since the last flush; nothing to encode.
+		return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, nil
+	}
+	if z.level == StatelessCompression {
+		// StatelessCompression writes through immediately; there is no
+		// compressor state to flush.
+		z.lastFlushIn = int64(z.size)
+		return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, nil
+	}
+	z.err = z.compressor.Flush()
+	if z.err == nil {
+		z.lastFlushIn = int64(z.size)
+	}
+	return flate.Flushed{Input: int64(z.size), Output: z.cw.n}, z.err
 }
 
 // Close closes the Writer, flushing any unwritten data to the underlying
@@ -268,13 +340,13 @@ func (z *Writer) Close() error {
 	if z.closed {
 		return nil
 	}
-	z.closed = true
 	if !z.wroteHeader {
 		z.Write(nil)
 		if z.err != nil {
 			return z.err
 		}
 	}
+	z.closed = true
 	if z.level == StatelessCompression {
 		z.err = flate.StatelessDeflate(z.w, nil, true, nil)
 	} else {

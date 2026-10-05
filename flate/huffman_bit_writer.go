@@ -112,6 +112,11 @@ type huffmanBitWriter struct {
 	// that Write errors are sticky.
 	writer io.Writer
 
+	// written is the total number of bytes successfully written to the
+	// underlying writer. It is used to report the output position of a
+	// flush boundary.
+	written int64
+
 	// Data waiting to be written is bytes[0:nbytes]
 	// and then the low nbits of bits.
 	bits            uint64
@@ -171,6 +176,7 @@ func newHuffmanBitWriter(w io.Writer) *huffmanBitWriter {
 func (w *huffmanBitWriter) reset(writer io.Writer) {
 	w.writer = writer
 	w.bits, w.nbits, w.nbytes, w.err = 0, 0, 0, nil
+	w.written = 0
 	w.lastHeader = 0
 	w.lastHuffMan = false
 }
@@ -236,7 +242,18 @@ func (w *huffmanBitWriter) write(b []byte) {
 	if w.err != nil {
 		return
 	}
-	_, w.err = w.writer.Write(b)
+	n, err := w.writer.Write(b)
+	w.written += int64(n)
+	if err != nil {
+		w.err = err
+		return
+	}
+	if n < len(b) {
+		// A writer that returns n < len(b) with a nil error violates the
+		// io.Writer contract. Record the actual prefix written and do not
+		// re-run compression of the same input; the error is sticky.
+		w.err = io.ErrShortWrite
+	}
 }
 
 func (w *huffmanBitWriter) writeBits(b int32, nb uint8) {
@@ -866,7 +883,7 @@ func (w *huffmanBitWriter) writeTokens(tokens []token, leCodes, oeCodes []hcode)
 	bits >>= nbits & 56
 	nbits &= 7
 	if nbytes >= bufferFlushSize {
-		_, w.err = w.writer.Write(w.bytes[:nbytes])
+		w.write(w.bytes[:nbytes])
 		nbytes = 0
 		if w.err != nil {
 			return
@@ -924,7 +941,7 @@ func (w *huffmanBitWriter) writeTokens(tokens []token, leCodes, oeCodes []hcode)
 				nbytes = 0
 				return
 			}
-			_, w.err = w.writer.Write(w.bytes[:nbytes])
+			w.write(w.bytes[:nbytes])
 			nbytes = 0
 		}
 	}
@@ -1079,7 +1096,7 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte, sync bool) {
 			if debugDeflate {
 				count += int(nbytes) * 8
 			}
-			_, w.err = w.writer.Write(w.bytes[:nbytes])
+			w.write(w.bytes[:nbytes])
 			nbytes = 0
 		}
 		a, b, c := encoding[input[0]], encoding[input[1]], encoding[input[2]]
@@ -1107,7 +1124,7 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte, sync bool) {
 				if debugDeflate {
 					count += int(nbytes) * 8
 				}
-				_, w.err = w.writer.Write(w.bytes[:nbytes])
+				w.write(w.bytes[:nbytes])
 				nbytes = 0
 			}
 		}

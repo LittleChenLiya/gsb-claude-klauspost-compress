@@ -124,6 +124,11 @@ type compressor struct {
 	blockStart int // window index where current tokens start
 	err        error
 
+	// totalIn is the total number of uncompressed bytes encoded so far.
+	totalIn int64
+	// lastFlushIn is the totalIn value at the last successful flush.
+	lastFlushIn int64
+
 	// queued output tokens
 	tokens tokens
 	fast   fastEnc
@@ -787,7 +792,9 @@ func (d *compressor) write(b []byte) (n int, err error) {
 		if d.windowEnd == len(d.window) || d.sync {
 			d.step(d)
 		}
-		b = b[d.fill(d, b):]
+		m := d.fill(d, b)
+		d.totalIn += int64(m)
+		b = b[m:]
 		if d.err != nil {
 			return 0, d.err
 		}
@@ -807,6 +814,9 @@ func (d *compressor) syncFlush() error {
 		d.err = d.w.err
 	}
 	d.sync = false
+	if d.err == nil {
+		d.lastFlushIn = d.totalIn
+	}
 	return d.err
 }
 
@@ -857,6 +867,8 @@ func (d *compressor) reset(w io.Writer) {
 	d.w.reset(w)
 	d.sync = false
 	d.err = nil
+	d.totalIn = 0
+	d.lastFlushIn = 0
 	// We only need to reset a few things for Snappy.
 	if d.fast != nil {
 		d.fast.Reset()
@@ -968,11 +980,20 @@ func NewWriterWindow(w io.Writer, windowSize int) (*Writer, error) {
 type Writer struct {
 	d    compressor
 	dict []byte
+	// closed is true after Close has been called. A closed Writer no longer
+	// accepts input.
+	closed bool
 }
+
+// errClosed is returned by Write when the Writer has been closed.
+var errClosed = errors.New("flate: writer is closed")
 
 // Write writes data to w, which will eventually write the
 // compressed form of data to its underlying writer.
 func (w *Writer) Write(data []byte) (n int, err error) {
+	if w.closed {
+		return 0, errClosed
+	}
 	return w.d.write(data)
 }
 
@@ -991,8 +1012,58 @@ func (w *Writer) Flush() error {
 	return w.d.syncFlush()
 }
 
+// Flushed describes the boundary reached by a FlushBoundary call.
+type Flushed struct {
+	// Input is the total number of uncompressed bytes encoded up to and
+	// including this flush boundary.
+	Input int64
+	// Output is the total number of compressed bytes actually written to
+	// the underlying writer up to and including this flush boundary.
+	// If the underlying writer short-writes, Output reflects the actual
+	// prefix written and the error reports the failure.
+	Output int64
+}
+
+// FlushBoundary flushes any pending data to the underlying writer and returns
+// a receipt describing the boundary reached.
+//
+// The receipt's Input field is the number of uncompressed bytes encoded up to
+// this point, and Output is the number of compressed bytes actually written.
+// FlushBoundary does not close the writer; after it returns the writer remains
+// open and can accept more input. Use Close to end the stream.
+//
+// If no input has been written since the last flush, FlushBoundary is a no-op
+// and returns the current boundary without emitting additional sync bytes.
+func (w *Writer) FlushBoundary() (Flushed, error) {
+	if w.d.err != nil {
+		return Flushed{Input: w.d.totalIn, Output: w.d.w.written}, w.d.err
+	}
+	if w.d.totalIn == w.d.lastFlushIn {
+		// No new input since the last flush; nothing to encode.
+		return Flushed{Input: w.d.totalIn, Output: w.d.w.written}, nil
+	}
+	err := w.d.syncFlush()
+	return Flushed{Input: w.d.totalIn, Output: w.d.w.written}, err
+}
+
+// InputBytes returns the total number of uncompressed bytes encoded by the
+// writer.
+func (w *Writer) InputBytes() int64 {
+	return w.d.totalIn
+}
+
+// OutputBytes returns the total number of compressed bytes actually written
+// to the underlying writer.
+func (w *Writer) OutputBytes() int64 {
+	return w.d.w.written
+}
+
 // Close flushes and closes the writer.
 func (w *Writer) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
 	return w.d.close()
 }
 
@@ -1000,6 +1071,7 @@ func (w *Writer) Close() error {
 // the result of NewWriter or NewWriterDict called with dst
 // and w's level and dictionary.
 func (w *Writer) Reset(dst io.Writer) {
+	w.closed = false
 	if len(w.dict) > 0 {
 		// w was created with NewWriterDict
 		w.d.reset(dst)
@@ -1016,6 +1088,7 @@ func (w *Writer) Reset(dst io.Writer) {
 // the result of NewWriter or NewWriterDict called with dst
 // and w's level, but sets a specific dictionary.
 func (w *Writer) ResetDict(dst io.Writer, dict []byte) {
+	w.closed = false
 	w.dict = dict
 	w.d.reset(dst)
 	w.d.fillWindow(w.dict)

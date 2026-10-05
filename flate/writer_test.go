@@ -593,3 +593,130 @@ func TestSilesiaRoundTrip(t *testing.T) {
 		check(t, NewReader(&buf))
 	})
 }
+
+// flushShortWriter is an io.Writer that short-writes on the shortOn-th Write
+// call, writing only half of the requested bytes and returning
+// io.ErrShortWrite.
+type flushShortWriter struct {
+	buf     bytes.Buffer
+	call    int
+	shortOn int
+}
+
+func (s *flushShortWriter) Write(p []byte) (int, error) {
+	s.call++
+	if s.call == s.shortOn {
+		n := len(p) / 2
+		if n == 0 {
+			n = 1
+		}
+		written, _ := s.buf.Write(p[:n])
+		return written, io.ErrShortWrite
+	}
+	return s.buf.Write(p)
+}
+
+// TestFlushBoundary verifies that a flush receipt reports the correct
+// uncompressed input and compressed output positions, that an empty flush is a
+// no-op, and that flush and close are distinct states.
+func TestFlushBoundary(t *testing.T) {
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, DefaultCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write([]byte("abc"))
+	r1, err := w.FlushBoundary()
+	if err != nil {
+		t.Fatalf("first FlushBoundary: %v", err)
+	}
+	if r1.Input != 3 {
+		t.Errorf("first flush Input = %d, want 3", r1.Input)
+	}
+	if r1.Output <= 0 {
+		t.Errorf("first flush Output = %d, want > 0", r1.Output)
+	}
+
+	w.Write([]byte("def"))
+	r2, err := w.FlushBoundary()
+	if err != nil {
+		t.Fatalf("second FlushBoundary: %v", err)
+	}
+	if r2.Input != 6 {
+		t.Errorf("second flush Input = %d, want 6", r2.Input)
+	}
+	if r2.Output <= r1.Output {
+		t.Errorf("second flush Output = %d, want > first Output %d", r2.Output, r1.Output)
+	}
+
+	// Empty flush is a no-op.
+	r3, err := w.FlushBoundary()
+	if err != nil {
+		t.Fatalf("empty FlushBoundary: %v", err)
+	}
+	if r3.Input != r2.Input || r3.Output != r2.Output {
+		t.Errorf("empty flush changed boundary: got (%d,%d), want (%d,%d)", r3.Input, r3.Output, r2.Input, r2.Output)
+	}
+
+	// After flush, the writer is still open.
+	if _, err := w.Write([]byte("ghi")); err != nil {
+		t.Errorf("Write after flush: %v, want nil", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// After close, the writer is closed and rejects new input.
+	if _, err := w.Write([]byte("jkl")); err == nil {
+		t.Error("Write after close: want error, got nil")
+	}
+
+	// The reader should consume the segments.
+	r := NewReader(&buf)
+	defer r.Close()
+	got := make([]byte, 9)
+	if _, err := io.ReadFull(r, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "abcdefghi" {
+		t.Errorf("got %q, want %q", got, "abcdefghi")
+	}
+}
+
+// TestFlushBoundaryShortWrite verifies that when the underlying writer
+// short-writes, the receipt reports the actual prefix written and no new input
+// is accepted after the failure.
+func TestFlushBoundaryShortWrite(t *testing.T) {
+	// The first flush uses several Write calls (stored block + sync marker).
+	// Short-write on the second flush.
+	sw := &flushShortWriter{shortOn: 7}
+	w, err := NewWriter(sw, DefaultCompression)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write([]byte("abc"))
+	r1, err := w.FlushBoundary()
+	if err != nil {
+		t.Fatalf("first FlushBoundary: %v", err)
+	}
+
+	w.Write([]byte("def"))
+	r2, err := w.FlushBoundary()
+	if err == nil {
+		t.Fatal("second FlushBoundary: want error on short write, got nil")
+	}
+	if r2.Input != 6 {
+		t.Errorf("second flush Input = %d, want 6", r2.Input)
+	}
+	if r2.Output <= r1.Output {
+		t.Errorf("second flush Output = %d, want > first Output %d (actual prefix)", r2.Output, r1.Output)
+	}
+
+	// After the failure, no new input is accepted.
+	if _, err := w.Write([]byte("ghi")); err == nil {
+		t.Error("Write after failure: want error, got nil")
+	}
+}
