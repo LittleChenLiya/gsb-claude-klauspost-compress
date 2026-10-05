@@ -124,6 +124,10 @@ type huffmanBitWriter struct {
 	codegenEncoding *huffmanEncoder
 	err             error
 	lastHeader      int
+	// bytesWritten is the number of bytes actually committed to the
+	// underlying writer. On a short write or failure only the accepted
+	// prefix is counted.
+	bytesWritten int64
 	// Set between 0 (reused block can be up to 2x the size)
 	logNewTablePenalty uint
 
@@ -236,7 +240,15 @@ func (w *huffmanBitWriter) write(b []byte) {
 	if w.err != nil {
 		return
 	}
-	_, w.err = w.writer.Write(b)
+	n, err := w.writer.Write(b)
+	// Record the actual prefix accepted by the underlying writer.
+	w.bytesWritten += int64(n)
+	if err == nil && n != len(b) {
+		// A short write is a commit failure; make it sticky so the
+		// same input is never silently re-compressed and re-sent.
+		err = io.ErrShortWrite
+	}
+	w.err = err
 }
 
 func (w *huffmanBitWriter) writeBits(b int32, nb uint8) {
@@ -866,7 +878,7 @@ func (w *huffmanBitWriter) writeTokens(tokens []token, leCodes, oeCodes []hcode)
 	bits >>= nbits & 56
 	nbits &= 7
 	if nbytes >= bufferFlushSize {
-		_, w.err = w.writer.Write(w.bytes[:nbytes])
+		w.write(w.bytes[:nbytes])
 		nbytes = 0
 		if w.err != nil {
 			return
@@ -924,7 +936,7 @@ func (w *huffmanBitWriter) writeTokens(tokens []token, leCodes, oeCodes []hcode)
 				nbytes = 0
 				return
 			}
-			_, w.err = w.writer.Write(w.bytes[:nbytes])
+			w.write(w.bytes[:nbytes])
 			nbytes = 0
 		}
 	}
@@ -1079,7 +1091,7 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte, sync bool) {
 			if debugDeflate {
 				count += int(nbytes) * 8
 			}
-			_, w.err = w.writer.Write(w.bytes[:nbytes])
+			w.write(w.bytes[:nbytes])
 			nbytes = 0
 		}
 		a, b, c := encoding[input[0]], encoding[input[1]], encoding[input[2]]
@@ -1107,7 +1119,7 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte, sync bool) {
 				if debugDeflate {
 					count += int(nbytes) * 8
 				}
-				_, w.err = w.writer.Write(w.bytes[:nbytes])
+				w.write(w.bytes[:nbytes])
 				nbytes = 0
 			}
 		}

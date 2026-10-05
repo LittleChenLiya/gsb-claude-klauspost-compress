@@ -239,3 +239,51 @@ func Example_synchronization() {
 	// Received 3 bytes: far
 	// Received 7 bytes: away...
 }
+
+// A FlushBoundary returns a receipt reporting how far the call
+// committed the stream: the uncompressed input position encoded so
+// far and the compressed output position actually written. A flush
+// boundary is not a close: the Closed field keeps the states apart.
+func ExampleWriter_FlushBoundary() {
+	var buf bytes.Buffer
+	zw, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Six input bytes, committed in two segments.
+	if _, err := zw.Write([]byte("abc")); err != nil {
+		log.Fatal(err)
+	}
+	flush, err := zw.FlushBoundary()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := zw.Write([]byte("def")); err != nil {
+		log.Fatal(err)
+	}
+	closed, err := zw.CloseBoundary()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("flush boundary: input=%d closed=%v\n", flush.Input, flush.Closed)
+	fmt.Printf("close boundary: input=%d closed=%v\n", closed.Input, closed.Closed)
+	fmt.Printf("output advanced between boundaries: %v\n", closed.Output > flush.Output)
+
+	// The committed stream decodes back to the six input bytes.
+	zr := flate.NewReader(&buf)
+	if _, err := io.Copy(os.Stdout, zr); err != nil {
+		log.Fatal(err)
+	}
+	if err := zr.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Output:
+	// flush boundary: input=3 closed=false
+	// close boundary: input=6 closed=true
+	// output advanced between boundaries: true
+	// abcdef
+}

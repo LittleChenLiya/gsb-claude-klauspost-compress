@@ -131,6 +131,12 @@ type compressor struct {
 
 	sync          bool // requesting flush
 	byteAvailable bool // if true, still need to process window[index-1].
+
+	// input is the number of uncompressed bytes consumed via write.
+	input int64
+	// closed is set once close has been invoked. A closed compressor
+	// never accepts new input again, even if closing failed.
+	closed bool
 }
 
 func (d *compressor) fillDeflate(b []byte) int {
@@ -787,7 +793,9 @@ func (d *compressor) write(b []byte) (n int, err error) {
 		if d.windowEnd == len(d.window) || d.sync {
 			d.step(d)
 		}
-		b = b[d.fill(d, b):]
+		m := d.fill(d, b)
+		b = b[m:]
+		d.input += int64(m)
 		if d.err != nil {
 			return 0, d.err
 		}
@@ -855,6 +863,9 @@ func (d *compressor) init(w io.Writer, level int) (err error) {
 // reset the state of the compressor.
 func (d *compressor) reset(w io.Writer) {
 	d.w.reset(w)
+	d.w.bytesWritten = 0
+	d.input = 0
+	d.closed = false
 	d.sync = false
 	d.err = nil
 	// We only need to reset a few things for Snappy.
@@ -889,6 +900,9 @@ func (d *compressor) reset(w io.Writer) {
 }
 
 func (d *compressor) close() error {
+	// Once close has been invoked, no new input is accepted,
+	// even if closing the stream fails.
+	d.closed = true
 	if d.err != nil {
 		return d.err
 	}
@@ -898,11 +912,15 @@ func (d *compressor) close() error {
 		return d.err
 	}
 	if d.w.writeStoredHeader(0, true); d.w.err != nil {
-		return d.w.err
+		// Keep the error sticky, so no new input is accepted
+		// after a failed close.
+		d.err = d.w.err
+		return d.err
 	}
 	d.w.flush()
+	d.err = d.w.err
 	d.w.reset(nil)
-	return d.w.err
+	return d.err
 }
 
 // NewWriter returns a new Writer compressing data at the given level.
