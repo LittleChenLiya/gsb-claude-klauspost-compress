@@ -846,7 +846,9 @@ func (d *compressor) init(w io.Writer, level int) (err error) {
 		d.fill = (*compressor).fillBlock
 		d.step = (*compressor).storeFast
 	default:
-		return fmt.Errorf("flate: invalid compression level %d: want value in range [-2, 9]", level)
+		// Note: custom window sizes (negative levels) are handled above,
+		// so any level reaching this point is invalid.
+		return fmt.Errorf("flate: %s", checkLevel(level))
 	}
 	d.level = level
 	return nil
