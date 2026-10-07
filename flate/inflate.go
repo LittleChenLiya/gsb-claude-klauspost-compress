@@ -9,7 +9,9 @@ package flate
 
 import (
 	"bufio"
+	"bytes"
 	"compress/flate"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -74,6 +76,30 @@ type Resetter interface {
 	// Reset discards any buffered data and resets the Resetter as if it was
 	// newly initialized with the given reader.
 	Reset(r io.Reader, dict []byte) error
+}
+
+// TrailingReader is implemented by the ReadCloser returned by NewReader,
+// NewReaderDict and NewReaderOpts. It allows retrieving the data that
+// follows the DEFLATE stream in the underlying reader, without requiring
+// the underlying reader to be seekable.
+type TrailingReader interface {
+	// TrailingReader returns a reader that yields the unconsumed bytes of
+	// the underlying reader, starting at the first byte after the end of
+	// the DEFLATE stream.
+	//
+	// The returned reader first yields any whole bytes that were read into
+	// the internal bit buffer but not consumed, then continues with the
+	// remaining data of the underlying reader. Reading it therefore
+	// consumes the underlying reader, so a concatenated stream (for
+	// example the next message) can be processed without seeking and
+	// without losing bytes to internal buffering.
+	// Bits of a partially consumed byte cannot be returned.
+	//
+	// TrailingReader must only be called after the stream has been read
+	// to io.EOF. If the stream has not been fully consumed, or if it ended
+	// with an error, an error is returned instead of a reader; a broken
+	// stream reports its decompression error, not a successful tail.
+	TrailingReader() (io.Reader, error)
 }
 
 // The data structure for decoding Huffman tables is based on that of
@@ -456,6 +482,36 @@ func (f *decompressor) Close() error {
 		return nil
 	}
 	return f.err
+}
+
+// TrailingReader implements the TrailingReader interface.
+func (f *decompressor) TrailingReader() (io.Reader, error) {
+	if f.err == nil || len(f.toRead) > 0 {
+		return nil, errors.New("flate: TrailingReader: stream not fully consumed")
+	}
+	if f.err != io.EOF {
+		// A broken stream reports its decompression error,
+		// not a successful tail.
+		return nil, f.err
+	}
+	// Whole bytes left in the bit buffer were read from the input,
+	// but not consumed. Bits of a partially consumed byte are dropped,
+	// since they cannot be reconstructed into a full byte.
+	b, nb := f.b, f.nb
+	f.b, f.nb = 0, 0
+	partial := nb & 7
+	b >>= partial
+	nb -= partial
+	if nb == 0 {
+		return f.r, nil
+	}
+	tail := make([]byte, 0, nb>>3)
+	for nb >= 8 {
+		tail = append(tail, byte(b))
+		b >>= 8
+		nb -= 8
+	}
+	return io.MultiReader(bytes.NewReader(tail), f.r), nil
 }
 
 // RFC 1951 section 3.2.7.
@@ -942,7 +998,8 @@ func NewReaderOpts(r io.Reader, opts ...ReaderOpt) io.ReadCloser {
 // It is the caller's responsibility to call Close on the ReadCloser
 // when finished reading.
 //
-// The ReadCloser returned by NewReader also implements Resetter.
+// The ReadCloser returned by NewReader also implements Resetter and
+// TrailingReader.
 func NewReader(r io.Reader) io.ReadCloser {
 	return NewReaderOpts(r)
 }
@@ -953,7 +1010,8 @@ func NewReader(r io.Reader) io.ReadCloser {
 // which has already been read. NewReaderDict is typically used
 // to read data compressed by NewWriterDict.
 //
-// The ReadCloser returned by NewReader also implements Resetter.
+// The ReadCloser returned by NewReader also implements Resetter and
+// TrailingReader.
 func NewReaderDict(r io.Reader, dict []byte) io.ReadCloser {
 	return NewReaderOpts(r, WithDict(dict))
 }

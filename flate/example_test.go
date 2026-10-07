@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"testing/iotest"
 
 	"github.com/klauspost/compress/flate"
 )
@@ -238,4 +239,43 @@ func Example_synchronization() {
 	// Received 4 bytes: far,
 	// Received 3 bytes: far
 	// Received 7 bytes: away...
+}
+
+// A DEFLATE stream can be followed by other data in the same reader.
+// TrailingReader returns the bytes that were not consumed by the
+// decompressor, even when the underlying reader only implements io.Reader
+// and cannot seek.
+func ExampleTrailingReader() {
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := w.Write([]byte("hello")); err != nil {
+		log.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		log.Fatal(err)
+	}
+	// Append a marker right after the compressed stream.
+	buf.WriteString("MAGIC")
+
+	// Hide ReadByte/Seek: only io.Reader is available to the decoder.
+	r := flate.NewReader(iotest.OneByteReader(&buf))
+	decoded, err := io.ReadAll(r)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tail, err := r.(flate.TrailingReader).TrailingReader()
+	if err != nil {
+		log.Fatal(err)
+	}
+	trailing, err := io.ReadAll(tail)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("decoded: %s\ntrailing: %s\n", decoded, trailing)
+	// Output:
+	// decoded: hello
+	// trailing: MAGIC
 }

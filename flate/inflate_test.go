@@ -9,11 +9,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 )
 
 func TestTruncatedDeflateReportsUnexpectedEOF(t *testing.T) {
@@ -487,5 +489,128 @@ func TestReaderPartialBlock(t *testing.T) {
 	actual := string(rb[:n])
 	if expected != actual {
 		t.Fatalf("expected: %v, got: %v", expected, actual)
+	}
+}
+
+func TestTrailingReader(t *testing.T) {
+	payload := []byte("deflate stream followed by a trailing magic marker")
+	magic := []byte("MAGIC")
+
+	readers := map[string]func([]byte) io.Reader{
+		"bytes.Reader":   func(b []byte) io.Reader { return bytes.NewReader(b) },
+		"bytes.Buffer":   func(b []byte) io.Reader { return bytes.NewBuffer(b) },
+		"strings.Reader": func(b []byte) io.Reader { return strings.NewReader(string(b)) },
+		"bufio.Reader":   func(b []byte) io.Reader { return bufio.NewReader(bytes.NewReader(b)) },
+		// Only implements io.Reader, no ReadByte and no Seek.
+		"one byte Reader": func(b []byte) io.Reader { return iotest.OneByteReader(bytes.NewReader(b)) },
+		"half Reader":     func(b []byte) io.Reader { return iotest.HalfReader(bytes.NewReader(b)) },
+		"generic Reader":  func(b []byte) io.Reader { return struct{ Reader }{bytes.NewReader(b)} },
+	}
+	for _, level := range []int{0, 1, 6, 9} {
+		var comp bytes.Buffer
+		w, err := NewWriter(&comp, level)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		stream := append(append([]byte{}, comp.Bytes()...), magic...)
+
+		for name, makeReader := range readers {
+			t.Run(fmt.Sprintf("level=%d/%s", level, name), func(t *testing.T) {
+				reader := NewReader(makeReader(stream))
+				tr, ok := reader.(TrailingReader)
+				if !ok {
+					t.Fatal("reader does not implement TrailingReader")
+				}
+				// The tail is only available once the stream is consumed.
+				if _, err := tr.TrailingReader(); err == nil {
+					t.Error("TrailingReader before EOF: got nil error, want error")
+				}
+				decoded, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if !bytes.Equal(decoded, payload) {
+					t.Fatalf("decoded %q, want %q", decoded, payload)
+				}
+				tail, err := tr.TrailingReader()
+				if err != nil {
+					t.Fatalf("TrailingReader: %v", err)
+				}
+				trailing, err := io.ReadAll(tail)
+				if err != nil {
+					t.Fatalf("read trailing: %v", err)
+				}
+				if !bytes.Equal(trailing, magic) {
+					t.Errorf("trailing %q, want %q", trailing, magic)
+				}
+				if err := reader.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestTrailingReaderBadStream(t *testing.T) {
+	payload := []byte("trailing bytes must not be reported for broken streams")
+	var comp bytes.Buffer
+	w, err := NewWriter(&comp, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stream := comp.Bytes()
+
+	readers := map[string]func([]byte) io.Reader{
+		"bytes.Reader":    func(b []byte) io.Reader { return bytes.NewReader(b) },
+		"one byte Reader": func(b []byte) io.Reader { return iotest.OneByteReader(bytes.NewReader(b)) },
+	}
+	for name, makeReader := range readers {
+		t.Run(name+"/truncated", func(t *testing.T) {
+			for cut := 1; cut < len(stream); cut++ {
+				reader := NewReader(makeReader(stream[:cut]))
+				tr := reader.(TrailingReader)
+				_, readErr := io.ReadAll(reader)
+				if readErr != io.ErrUnexpectedEOF {
+					t.Fatalf("cut at %d: read got %v, want io.ErrUnexpectedEOF", cut, readErr)
+				}
+				tail, err := tr.TrailingReader()
+				if err != io.ErrUnexpectedEOF {
+					t.Errorf("cut at %d: TrailingReader got %v, want io.ErrUnexpectedEOF", cut, err)
+				}
+				if tail != nil {
+					t.Errorf("cut at %d: TrailingReader returned a reader for a broken stream", cut)
+				}
+			}
+		})
+		t.Run(name+"/corrupt", func(t *testing.T) {
+			bad := append([]byte{}, stream...)
+			// Force the reserved block type (3) in the first block header.
+			bad[0] = bad[0]&1 | 0x6
+			reader := NewReader(makeReader(bad))
+			tr := reader.(TrailingReader)
+			_, readErr := io.ReadAll(reader)
+			if readErr == nil {
+				t.Fatal("read of corrupt stream succeeded")
+			}
+			tail, err := tr.TrailingReader()
+			if err != readErr {
+				t.Errorf("TrailingReader got %v, want the decompression error %v", err, readErr)
+			}
+			if tail != nil {
+				t.Error("TrailingReader returned a reader for a corrupt stream")
+			}
+		})
 	}
 }
