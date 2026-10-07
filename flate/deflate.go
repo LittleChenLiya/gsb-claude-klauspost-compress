@@ -905,6 +905,120 @@ func (d *compressor) close() error {
 	return d.w.err
 }
 
+// ErrInvalidLevel is returned by [CheckWriter] when the requested
+// compression level is not one of the values accepted by [NewWriter].
+// Use [errors.Is] to detect this specific invalid item.
+var ErrInvalidLevel = errors.New("flate: invalid compression level")
+
+// ErrEmptyDictionary is returned by [CheckWriter] when a dictionary was
+// requested but contained no bytes.
+// Use [errors.Is] to detect this specific invalid item.
+var ErrEmptyDictionary = errors.New("flate: empty preset dictionary")
+
+// invalidLevelError carries the rejected level so the message stays
+// identical to the one produced while constructing a Writer.
+type invalidLevelError struct {
+	level int
+}
+
+func (e *invalidLevelError) Error() string {
+	return fmt.Sprintf("flate: invalid compression level %d: want value in range [-2, 9]", e.level)
+}
+
+// Is reports the target as [ErrInvalidLevel], so callers can match the
+// concrete message or the generic invalid-item sentinel.
+func (e *invalidLevelError) Is(target error) bool {
+	return target == ErrInvalidLevel
+}
+
+// ErrInvalidConfig is returned when a WriterConfig was not produced by a
+// successful [CheckWriter] and therefore cannot build a [Writer].
+var ErrInvalidConfig = errors.New("flate: writer configuration is not valid")
+
+// WriterConfig is a validated Writer configuration produced by
+// [CheckWriter]. It holds no writer state and can be reused to create any
+// number of [Writer] values, possibly targeting different io.Writers.
+//
+// The zero value is not a usable configuration; obtain one from
+// [CheckWriter].
+type WriterConfig struct {
+	level int
+	dict  []byte
+	ok    bool
+}
+
+// Level returns the compression level of the configuration.
+func (c WriterConfig) Level() int { return c.level }
+
+// Dict returns the preset dictionary of the configuration. The returned
+// slice must not be modified while configurations or writers derived from
+// it are in use.
+func (c WriterConfig) Dict() []byte { return c.dict }
+
+// CheckWriter performs a side-effect free preflight check of the
+// parameters accepted by [NewWriter] (dict == nil) and [NewWriterDict]
+// (dict != nil).
+//
+// Both the compression level and the dictionary selection are validated in
+// a single pass and the returned error identifies every invalid item.
+// Passing a non-nil dict that contains no bytes is rejected with
+// [ErrEmptyDictionary]; levels outside the range documented on [NewWriter]
+// are rejected with [ErrInvalidLevel]. If both items are invalid the
+// returned error matches both sentinels through [errors.Is].
+//
+// A successful result can be passed to [WriterConfig.NewWriter] to create
+// a Writer. A failed check returns the zero configuration and never takes
+// an output writer, so callers can run the check before opening their
+// destination; the zero configuration refuses to build a writer.
+func CheckWriter(level int, dict []byte) (WriterConfig, error) {
+	var errs []error
+	if !validLevel(level) {
+		errs = append(errs, &invalidLevelError{level: level})
+	}
+	if dict != nil && len(dict) == 0 {
+		errs = append(errs, ErrEmptyDictionary)
+	}
+	if len(errs) != 0 {
+		return WriterConfig{}, errors.Join(errs...)
+	}
+	return WriterConfig{level: level, dict: dict, ok: true}, nil
+}
+
+// NewWriter creates a [Writer] that writes compressed output to w using
+// the previously validated configuration.
+//
+// The configuration must come from a successful [CheckWriter]; otherwise
+// [ErrInvalidConfig] is returned, no Writer is created and w is never
+// touched.
+func (c WriterConfig) NewWriter(w io.Writer) (*Writer, error) {
+	if !c.ok {
+		return nil, ErrInvalidConfig
+	}
+	return newCompressingWriter(w, c.level, c.dict)
+}
+
+// validLevel reports whether level is accepted by NewWriter/NewWriterDict.
+// Negative custom window sizes used by NewWriterWindow are deliberately
+// excluded: those values belong to the window-based constructor.
+func validLevel(level int) bool {
+	return level >= ConstantCompression && level <= BestCompression
+}
+
+// newCompressingWriter builds a Writer from an already validated level and
+// optional dictionary. It is shared by the constructors and
+// WriterConfig.NewWriter, so the construction semantics stay identical.
+func newCompressingWriter(w io.Writer, level int, dict []byte) (*Writer, error) {
+	var dw Writer
+	if err := dw.d.init(w, level); err != nil {
+		return nil, err
+	}
+	if dict != nil {
+		dw.d.fillWindow(dict)
+		dw.dict = append(dw.dict, dict...) // duplicate dictionary for Reset method.
+	}
+	return &dw, nil
+}
+
 // NewWriter returns a new Writer compressing data at the given level.
 // Following zlib, levels range from 1 (BestSpeed) to 9 (BestCompression);
 // higher levels typically run slower but compress more.
@@ -918,11 +1032,7 @@ func (d *compressor) close() error {
 // If level is in the range [-2, 9] then the error returned will be nil.
 // Otherwise the error returned will be non-nil.
 func NewWriter(w io.Writer, level int) (*Writer, error) {
-	var dw Writer
-	if err := dw.d.init(w, level); err != nil {
-		return nil, err
-	}
-	return &dw, nil
+	return newCompressingWriter(w, level, nil)
 }
 
 // NewWriterDict is like NewWriter but initializes the new
@@ -932,13 +1042,7 @@ func NewWriter(w io.Writer, level int) (*Writer, error) {
 // can only be decompressed by a Reader initialized with the
 // same dictionary.
 func NewWriterDict(w io.Writer, level int, dict []byte) (*Writer, error) {
-	zw, err := NewWriter(w, level)
-	if err != nil {
-		return nil, err
-	}
-	zw.d.fillWindow(dict)
-	zw.dict = append(zw.dict, dict...) // duplicate dictionary for Reset method.
-	return zw, err
+	return newCompressingWriter(w, level, dict)
 }
 
 // MinCustomWindowSize is the minimum window size that can be sent to NewWriterWindow.
