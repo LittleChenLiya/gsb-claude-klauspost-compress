@@ -9,7 +9,9 @@ package flate
 
 import (
 	"bufio"
+	"bytes"
 	"compress/flate"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -349,6 +351,117 @@ type decompressor struct {
 	hasCP     bool  // WithResumeFrom was supplied
 	uncOffset int64 // baseline uncompressed offset (from a resume checkpoint)
 	cpBuf     []byte
+
+	// keepTrailing is set by WithTrailingBytes. Once the final block has
+	// been consumed, TrailingBytes can return the bytes past the end of the
+	// DEFLATE stream without over-reading the next message.
+	keepTrailing bool
+	// tail holds collected trailing bytes; tailDone marks collection as
+	// finished, so a repeated TrailingBytes does not drain the reader twice
+	// even when the trailer is empty.
+	tail     []byte
+	tailDone bool
+	// src is the reader as supplied to NewReaderOpts/Reset. When it also
+	// implements Reader, the decoder's maxRead optimization may leave the
+	// trailer entirely unread in src; TrailingBytes drains it directly.
+	src io.Reader
+	// br is the bufio.Reader inserted by makeReader when the input only
+	// implements io.Reader; it may hold bytes read ahead of the stream.
+	br *bufio.Reader
+}
+
+// TrailingReader is a ReadCloser that can report the bytes remaining after
+// the DEFLATE stream ends. It is returned by NewReaderOpts together with
+// WithTrailingBytes. Trailing bytes are the unconsumed input following the
+// final block: any padding bits in the final byte are discarded, as required
+// by RFC 1951.
+type TrailingReader interface {
+	io.ReadCloser
+
+	// TrailingBytes returns the unconsumed bytes after the final block,
+	// including any bytes buffered by the decompressor. It does not Seek
+	// and never reads more than the decompressor's own buffering allows,
+	// so the next message is not over-read.
+	//
+	// The returned slice is valid until the next Read, Reset or Close.
+	// It returns ErrNotEOF unless the stream has been fully decompressed
+	// and Read has reported io.EOF; a corrupt or truncated stream keeps
+	// returning its original decompression error instead of trailing bytes.
+	TrailingBytes() ([]byte, error)
+}
+
+// ErrNotEOF is returned by TrailingReader.TrailingBytes when the stream has
+// not yet ended.
+var ErrNotEOF = errors.New("flate: trailing bytes are only available after io.EOF")
+
+// TrailingBytes returns the unconsumed input bytes after the final DEFLATE
+// block. See TrailingReader for the semantics.
+func (f *decompressor) TrailingBytes() ([]byte, error) {
+	if f.err != io.EOF {
+		if f.err == nil {
+			return nil, ErrNotEOF
+		}
+		return nil, f.err
+	}
+	if !f.keepTrailing {
+		return nil, ErrNotEOF
+	}
+	if f.tailDone {
+		// Collected on a previous call; do not drain the reader twice.
+		return f.tail, nil
+	}
+	var parts [][]byte
+	if f.br != nil {
+		// The decoder read through an inserted bufio.Reader. Everything
+		// already fetched past the stream (including any bytes backing the
+		// unconsumed bits in f.nb) is in its buffer; Peek does not fetch
+		// more from the underlying reader. Anything beyond the buffer is
+		// still in the original source.
+		b, _ := f.br.Peek(f.br.Buffered())
+		parts = append(parts, b)
+		f.collectFromSource(&parts, f.src)
+	} else {
+		// A direct Reader (one that implements io.ByteReader) uses the
+		// maxRead optimization: f.nb may hold whole bytes fetched past the
+		// EOB and the remaining trailer sits in the source itself.
+		if f.nb>>3 > 0 {
+			b := make([]byte, f.nb>>3)
+			for i := range b {
+				b[i] = byte(f.b >> (uint(i) * 8))
+			}
+			f.nb &= 7 // only padding bits may remain
+			f.b = 0
+			parts = append(parts, b)
+		}
+		f.collectFromSource(&parts, f.src)
+	}
+	f.tail = bytes.Join(parts, nil)
+	f.tailDone = true
+	return f.tail, nil
+}
+
+// collectFromSource drains the unconsumed bytes of src into parts without
+// over-reading: a ByteReader is consumed one byte at a time until its first
+// error (normally io.EOF); a plain io.Reader is read until EOF.
+func (f *decompressor) collectFromSource(parts *[][]byte, src io.Reader) {
+	if src == nil {
+		return
+	}
+	if br, ok := src.(io.ByteReader); ok {
+		var drained []byte
+		for {
+			c, err := br.ReadByte()
+			if err != nil {
+				break
+			}
+			drained = append(drained, c)
+		}
+		*parts = append(*parts, drained)
+		return
+	}
+	if b, err := io.ReadAll(src); err == nil {
+		*parts = append(*parts, b)
+	}
 }
 
 func (f *decompressor) nextBlock() {
@@ -784,11 +897,24 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 	}
 }
 
-func makeReader(r io.Reader) Reader {
+// trailingBufSize is the read-ahead buffer used when trailing bytes are
+// requested from a plain io.Reader (one without ReadByte). It bounds how
+// much of a trailer past the DEFLATE stream can be recovered without
+// Seek support: the decoder never reads ahead past the buffer, and any
+// trailer longer than the unused buffer capacity remains in the
+// underlying reader. Inputs implementing io.ByteReader have no such bound.
+const trailingBufSize = 64 << 10
+
+func makeReader(r io.Reader, largeBuffer bool) (Reader, *bufio.Reader) {
 	if rr, ok := r.(Reader); ok {
-		return rr
+		return rr, nil
 	}
-	return bufio.NewReader(r)
+	if largeBuffer {
+		br := bufio.NewReaderSize(r, trailingBufSize)
+		return br, br
+	}
+	br := bufio.NewReader(r)
+	return br, br
 }
 
 func fixedHuffmanDecoderInit() {
@@ -812,14 +938,18 @@ func fixedHuffmanDecoderInit() {
 }
 
 func (f *decompressor) Reset(r io.Reader, dict []byte) error {
+	nr, br := makeReader(r, f.keepTrailing)
 	*f = decompressor{
-		r:        makeReader(r),
-		bits:     f.bits,
-		codebits: f.codebits,
-		h1:       f.h1,
-		h2:       f.h2,
-		dict:     f.dict,
-		step:     nextBlock,
+		r:            nr,
+		br:           br,
+		src:          r,
+		keepTrailing: f.keepTrailing,
+		bits:         f.bits,
+		codebits:     f.codebits,
+		h1:           f.h1,
+		h2:           f.h2,
+		dict:         f.dict,
+		step:         nextBlock,
 	}
 	f.dict.init(maxMatchOffset, dict)
 	return nil
@@ -828,15 +958,19 @@ func (f *decompressor) Reset(r io.Reader, dict []byte) error {
 // ResetCP will adjust the input to the provided checkpoint.
 // It is assumed the input stream is forwarded to cp.CompressedOffset.
 func (f *decompressor) ResetCP(r io.Reader, cp InflateCheckpoint) error {
+	nr, br := makeReader(r, f.keepTrailing)
 	*f = decompressor{
-		r:        makeReader(r),
-		bits:     f.bits,
-		codebits: f.codebits,
-		h1:       f.h1,
-		h2:       f.h2,
-		dict:     f.dict,
-		step:     nextBlock,
-		cpBuf:    f.cpBuf,
+		r:            nr,
+		br:           br,
+		src:          r,
+		keepTrailing: f.keepTrailing,
+		bits:         f.bits,
+		codebits:     f.codebits,
+		h1:           f.h1,
+		h2:           f.h2,
+		dict:         f.dict,
+		step:         nextBlock,
+		cpBuf:        f.cpBuf,
 	}
 	return f.applyCP(cp)
 }
@@ -881,6 +1015,20 @@ func WithDict(dict []byte) ReaderOpt {
 	}
 }
 
+// WithTrailingBytes enables collecting the unconsumed input bytes after the
+// final DEFLATE block. The returned reader implements TrailingReader, whose
+// TrailingBytes method can be called after Read reports io.EOF.
+//
+// This option is retained across Reset. It does not require the underlying
+// reader to support Seek: when the input only implements io.Reader, the
+// decompressor's own buffering is used, so the next message is never
+// over-read.
+func WithTrailingBytes() ReaderOpt {
+	return func(f *decompressor) {
+		f.keepTrailing = true
+	}
+}
+
 // InflateCheckpoint provides a resumable checkpoint for inflate.
 type InflateCheckpoint struct {
 	UncompressedOffset int64  // Byte offset in the decompressed stream
@@ -911,20 +1059,26 @@ func WithResumeFrom(cp InflateCheckpoint) ReaderOpt {
 	}
 }
 
-// NewReaderOpts returns new reader with provided options
+// NewReaderOpts returns new reader with provided options.
+// If the WithTrailingBytes option is supplied, the returned ReadCloser also
+// implements TrailingReader.
 func NewReaderOpts(r io.Reader, opts ...ReaderOpt) io.ReadCloser {
 	fixedHuffmanDecoderInit()
 
 	var f decompressor
-	f.r = makeReader(r)
 	f.bits = new([maxNumLit + maxNumDist]int)
 	f.codebits = new([numCodes]int)
-	f.step = nextBlock
 	f.dict.init(maxMatchOffset, nil)
 
 	for _, opt := range opts {
 		opt(&f)
 	}
+
+	// Create the input after the options so WithTrailingBytes can size the
+	// inserted buffering.
+	f.r, f.br = makeReader(r, f.keepTrailing)
+	f.src = r
+	f.step = nextBlock
 
 	if f.hasCP {
 		if err := f.applyCP(f.cp); err != nil {
